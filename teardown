@@ -1,0 +1,704 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile, spawnSync } = require('child_process');
+
+const USAGE = `usage: teardown [path] [--dry-run] [--force] [--yes]
+       teardown sweep [filter] [--dry-run] [--force] [--yes] [--no-fetch] [--keep-build-cache]
+
+Removes a finished git worktree together with the Docker Compose stack started
+from it: containers, networks, volumes, images built for the stack, the folder.
+
+  path                 a folder inside the worktree (default: the current folder)
+  sweep                list stale worktrees and leftover stacks, pick which to remove;
+                       repositories are found under $TEARDOWN_ROOTS (colon-separated,
+                       default ~/Dev)
+  filter               keep only rows whose path or project name contains this text
+  --dry-run            show what would be deleted, delete nothing
+  --force              do not ask the extra question for worktrees that are running,
+                       dirty or unpushed (required for them with --yes or in a script)
+  --yes                do not ask; sweep takes the rows marked [x] and keeps the build cache
+  --no-fetch           sweep: skip git fetch --prune
+  --keep-build-cache   sweep: do not offer to free the Docker build cache
+  -h, --help           show this help`;
+
+const VERDICTS = {
+  running: { label: 'running', preMarked: false, blocked: 'a container of its stack is still running' },
+  dirty: { label: 'dirty', preMarked: false, blocked: 'it has uncommitted changes' },
+  unpushed: { label: 'unpushed', preMarked: false, blocked: 'its HEAD commit is not on any remote branch' },
+  merged: { label: 'merged', preMarked: true, blocked: null },
+  open: { label: 'open', preMarked: false, blocked: null },
+  'folder-gone': { label: 'folder gone', preMarked: true, blocked: null },
+  'folder-unknown': { label: 'folder unknown', preMarked: false, blocked: null },
+};
+
+const PROJECT_LABEL = 'com.docker.compose.project';
+const WORKING_DIR_LABEL = 'com.docker.compose.project.working_dir';
+const SIZE_UNITS = { '': 1, k: 1e3, K: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15 };
+
+function parseSize(text) {
+  const match = /^([\d.]+)\s*([kKMGTP]?)B$/.exec(String(text).trim());
+  return match ? Math.round(parseFloat(match[1]) * SIZE_UNITS[match[2]]) : 0;
+}
+
+function formatSize(bytes) {
+  if (bytes < 1000) return `${bytes} B`;
+  const units = ['kB', 'MB', 'GB', 'TB', 'PB'];
+  let value = bytes / 1000;
+  let unit = 0;
+  while (value >= 999.95 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function sanitizeProject(name) {
+  return name.toLowerCase().replace(/[^a-z0-9_-]/g, '').replace(/^[^a-z0-9]+/, '');
+}
+
+function nameMatches(project, folder) {
+  const base = sanitizeProject(path.basename(folder));
+  if (!base) return false;
+  return project === base || new RegExp(`^(.+-)?${base}-[0-9a-f]{6,}$`).test(project);
+}
+
+function isInside(child, parent) {
+  return child === parent || child.startsWith(parent + path.sep);
+}
+
+function ownerOf(stack, checkouts, exists) {
+  if (stack.workingDir) {
+    const owners = checkouts.filter((c) => isInside(stack.workingDir, c.path));
+    if (owners.length) {
+      const deepest = owners.reduce((a, b) => (b.path.length > a.path.length ? b : a));
+      return { kind: 'checkout', checkout: deepest, byName: false };
+    }
+    return { kind: exists(stack.workingDir) ? 'elsewhere' : 'gone' };
+  }
+  const named = checkouts.filter((c) => nameMatches(stack.project, c.path));
+  if (named.length === 1) return { kind: 'checkout', checkout: named[0], byName: true };
+  return { kind: named.length ? 'elsewhere' : 'unknown' };
+}
+
+function stackVerdict(stack, ownerKind) {
+  if (stack.containers.some((c) => c.running)) return { kind: 'running' };
+  return { kind: ownerKind === 'gone' ? 'folder-gone' : 'folder-unknown' };
+}
+
+function buildTargets(stacks, checkouts, exists) {
+  const byPath = new Map();
+  for (const c of checkouts) {
+    if (c.worktree) byPath.set(c.path, { worktree: c.worktree, stacks: [], verdict: null });
+  }
+  const orphans = [];
+  for (const stack of stacks) {
+    const owner = ownerOf(stack, checkouts, exists);
+    if (owner.kind === 'checkout') {
+      byPath.get(owner.checkout.path)?.stacks.push({ ...stack, matchedByName: owner.byName });
+    } else if (owner.kind !== 'elsewhere') {
+      orphans.push({ worktree: null, stacks: [{ ...stack, matchedByName: false }], verdict: stackVerdict(stack, owner.kind) });
+    }
+  }
+  const worktrees = [...byPath.values()].sort((a, b) => a.worktree.path.localeCompare(b.worktree.path));
+  orphans.sort((a, b) => a.stacks[0].project.localeCompare(b.stacks[0].project));
+  return [...worktrees, ...orphans];
+}
+
+function filterTargets(targets, text) {
+  if (!text) return targets;
+  return targets.filter(
+    (t) => (t.worktree && t.worktree.path.includes(text)) || t.stacks.some((s) => s.project.includes(text)),
+  );
+}
+
+function worktreeVerdict({ running, dirty, merged, onRemote }) {
+  if (running) return { kind: 'running' };
+  if (dirty) return { kind: 'dirty' };
+  if (merged) return { kind: 'merged' };
+  if (!onRemote) return { kind: 'unpushed' };
+  return { kind: 'open' };
+}
+
+function planRows(target, folderBytes) {
+  const rows = [];
+  for (const s of target.stacks) {
+    rows.push(['stack', s.project + (s.matchedByName ? ' (matched by name)' : ''), null]);
+    for (const c of s.containers) rows.push(['container', c.name + (c.running ? ' (running)' : ''), c.bytes]);
+    for (const n of s.networks) rows.push(['network', n, null]);
+    for (const v of s.volumes) rows.push(['volume', v.name, v.bytes]);
+    for (const i of s.images) rows.push(['image', i.ref, i.bytes]);
+  }
+  if (target.worktree) rows.push(['folder', target.worktree.path, folderBytes]);
+  return rows;
+}
+
+function totalBytes(rows) {
+  return rows.reduce((sum, row) => sum + (row[2] || 0), 0);
+}
+
+function parseSelection(answer, kinds, force) {
+  const text = answer.trim().toLowerCase();
+  if (text === '') return { indices: kinds.flatMap((k, i) => (VERDICTS[k].preMarked ? [i] : [])) };
+  if (text === 'n' || text === 'no') return { indices: [] };
+  const tokens = text.split(/[\s,]+/).filter(Boolean);
+  const bad = tokens.find((t) => !/^\d+$/.test(t) || Number(t) < 1 || Number(t) > kinds.length);
+  if (bad !== undefined) return { error: `${bad} is not a row number.` };
+  const indices = [...new Set(tokens.map((t) => Number(t) - 1))];
+  const blocked = indices.find((i) => VERDICTS[kinds[i]].blocked);
+  if (blocked !== undefined && !force) {
+    const v = VERDICTS[kinds[blocked]];
+    return { error: `Row ${blocked + 1} is ${v.label}: ${v.blocked}. Run with --force to allow it.` };
+  }
+  return { indices };
+}
+
+function pickerStep(state, key) {
+  const { cursor, checked } = state;
+  if (key === '\x1b[A' || key === 'k') return { ...state, cursor: Math.max(cursor - 1, 0) };
+  if (key === '\x1b[B' || key === 'j') return { ...state, cursor: Math.min(cursor + 1, checked.length - 1) };
+  if (key === ' ') return { ...state, checked: checked.map((c, i) => (i === cursor ? !c : c)) };
+  return state;
+}
+
+function pickerLines(texts, bytes, state, width, height) {
+  const visible = Math.max(Math.min(texts.length, height - 2), 1);
+  const start = Math.min(Math.max(state.cursor - Math.floor(visible / 2), 0), texts.length - visible);
+  const body = texts.slice(start, start + visible).map((text, k) => {
+    const i = start + k;
+    return `${i === state.cursor ? '>' : ' '} ${state.checked[i] ? '[x]' : '[ ]'}  ${text}`;
+  });
+  const picked = bytes.filter((_, i) => state.checked[i]);
+  const position = texts.length > visible ? `  (row ${state.cursor + 1} of ${texts.length})` : '';
+  return [
+    'Up/Down = move, Space = select or unselect, Enter = continue, q = cancel',
+    ...body,
+    `${picked.length} selected, ${formatSize(picked.reduce((a, b) => a + b, 0))}${position}`,
+  ].map((line) => line.slice(0, width - 1));
+}
+
+function risk(target) {
+  const verdict = VERDICTS[target.verdict.kind];
+  return verdict.blocked ? target.verdict.detail || verdict.blocked : null;
+}
+
+function targetName(target) {
+  return target.worktree ? target.worktree.path : target.stacks[0].project;
+}
+
+function columns(rows, rightAligned) {
+  const widths = rows[0].map((_, i) => Math.max(...rows.map((r) => r[i].length)));
+  return rows
+    .map((r) => r.map((cell, i) => (rightAligned.includes(i) ? cell.padStart(widths[i]) : cell.padEnd(widths[i]))).join('  ').trimEnd())
+    .join('\n');
+}
+
+function progress(label, detail = '') {
+  if (!process.stderr.isTTY) return;
+  const room = Math.max((process.stderr.columns || 80) - 1 - label.length, 0);
+  const shown = detail.length > room ? `...${detail.slice(detail.length - room + 3)}`.slice(0, room) : detail;
+  process.stderr.write(`\r\x1b[K${label}${shown}`);
+}
+
+function fail(message) {
+  progress('');
+  console.error(`teardown: ${message}`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const opts = { sweep: false, dryRun: false, force: false, yes: false, fetch: true, keepBuildCache: false, positional: null };
+  const args = [...argv];
+  if (args[0] === 'sweep') {
+    opts.sweep = true;
+    args.shift();
+  }
+  for (const arg of args) {
+    if (arg === '-h' || arg === '--help') {
+      console.log(USAGE);
+      process.exit(0);
+    } else if (arg === '--dry-run') opts.dryRun = true;
+    else if (arg === '--force') opts.force = true;
+    else if (arg === '--yes') opts.yes = true;
+    else if (arg === '--no-fetch' && opts.sweep) opts.fetch = false;
+    else if (arg === '--keep-build-cache' && opts.sweep) opts.keepBuildCache = true;
+    else if (arg.startsWith('-')) fail(`unknown option ${arg}\n\n${USAGE}`);
+    else if (opts.positional !== null) fail(`unexpected argument ${arg}\n\n${USAGE}`);
+    else opts.positional = arg;
+  }
+  return opts;
+}
+
+function run(cmd, args, options = {}) {
+  const result = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, ...options });
+  if (result.error) return { ok: false, out: '', err: result.error.message };
+  return { ok: result.status === 0, out: result.stdout, err: result.stderr.trim() };
+}
+
+function git(args) {
+  return run('git', args);
+}
+
+function docker(args) {
+  const result = run('docker', args);
+  if (!result.ok) fail(`docker ${args.join(' ')} failed: ${result.err}`);
+  return result.out;
+}
+
+function lines(text) {
+  return text.split('\n').map((l) => l.trim()).filter(Boolean);
+}
+
+function real(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+function loadStacks() {
+  const filter = ['--filter', `label=${PROJECT_LABEL}`];
+  const df = JSON.parse(docker(['system', 'df', '-v', '--format', 'json']));
+  const sizes = (rows, key, field) => new Map((rows || []).map((r) => [r[key], parseSize(r[field])]));
+  const containerBytes = sizes(df.Containers, 'ID', 'Size');
+  const volumeBytes = sizes(df.Volumes, 'Name', 'Size');
+  const imageBytes = sizes(df.Images, 'ID', 'UniqueSize');
+
+  const stacks = new Map();
+  const stackOf = (project) => {
+    if (!stacks.has(project)) {
+      stacks.set(project, { project, workingDir: null, containers: [], networks: [], volumes: [], images: [] });
+    }
+    return stacks.get(project);
+  };
+
+  const containerIds = lines(docker(['ps', '-aq', '--no-trunc', ...filter]));
+  for (const c of containerIds.length ? JSON.parse(docker(['inspect', ...containerIds])) : []) {
+    const stack = stackOf(c.Config.Labels[PROJECT_LABEL]);
+    const workingDir = c.Config.Labels[WORKING_DIR_LABEL];
+    if (workingDir && !stack.workingDir) stack.workingDir = real(workingDir);
+    stack.containers.push({
+      id: c.Id,
+      name: c.Name.replace(/^\//, ''),
+      running: c.State.Running,
+      bytes: containerBytes.get(c.Id) || 0,
+    });
+  }
+  const labelled = (kind) =>
+    lines(docker([kind, 'ls', ...filter, '--format', `{{.Name}}\t{{.Label "${PROJECT_LABEL}"}}`])).map((row) => row.split('\t'));
+  for (const [name, project] of labelled('network')) stackOf(project).networks.push(name);
+  for (const [name, project] of labelled('volume')) {
+    stackOf(project).volumes.push({ name, bytes: volumeBytes.get(name) || 0 });
+  }
+  const imageIds = [...new Set(lines(docker(['image', 'ls', '-q', '--no-trunc', ...filter])))];
+  for (const image of imageIds.length ? JSON.parse(docker(['image', 'inspect', ...imageIds])) : []) {
+    stackOf(image.Config.Labels[PROJECT_LABEL]).images.push({
+      id: image.Id,
+      ref: (image.RepoTags || [])[0] || image.Id,
+      bytes: imageBytes.get(image.Id) || 0,
+    });
+  }
+  return [...stacks.values()];
+}
+
+function mainCheckoutOf(commonDir) {
+  return path.basename(commonDir) === '.git' ? path.dirname(commonDir) : commonDir;
+}
+
+function repoOf(dir) {
+  const result = git(['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir']);
+  return result.ok ? mainCheckoutOf(real(result.out.trim())) : null;
+}
+
+function findRepos(roots) {
+  const found = [];
+  const walk = (dir, depth) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((e) => e.name === '.git' && e.isDirectory())) found.push(real(dir));
+    if (depth === 5) return;
+    for (const e of entries) {
+      if (e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules') walk(path.join(dir, e.name), depth + 1);
+    }
+  };
+  for (const root of roots) walk(root, 0);
+  return found;
+}
+
+function listCheckouts(repo) {
+  const result = git(['-C', repo, 'worktree', 'list', '--porcelain']);
+  if (!result.ok) return [];
+  return result.out
+    .trim()
+    .split('\n\n')
+    .map((block) => {
+      const fields = Object.fromEntries(block.split('\n').map((l) => [l.split(' ')[0], l.slice(l.indexOf(' ') + 1)]));
+      return { fields, path: real(fields.worktree) };
+    })
+    .map(({ fields, path: p }, i, all) => ({
+      path: p,
+      worktree:
+        i === 0
+          ? null
+          : { path: p, repo: all[0].path, branch: fields.branch ? fields.branch.replace(/^refs\/heads\//, '') : null, head: fields.HEAD },
+    }))
+    .filter(({ path: p }) => fs.existsSync(p));
+}
+
+function discoverCheckouts(stacks, extraRepo) {
+  const roots = (process.env.TEARDOWN_ROOTS || path.join(os.homedir(), 'Dev')).split(':').filter(Boolean);
+  const repos = new Set(findRepos(roots));
+  if (extraRepo) repos.add(extraRepo);
+  for (const s of stacks) {
+    if (s.workingDir && fs.existsSync(s.workingDir)) {
+      const repo = repoOf(s.workingDir);
+      if (repo) repos.add(repo);
+    }
+  }
+  const seen = new Set();
+  return [...repos].flatMap(listCheckouts).filter((c) => !seen.has(c.path) && seen.add(c.path));
+}
+
+function defaultBranch(dir) {
+  const head = git(['-C', dir, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']);
+  if (head.ok) return head.out.trim();
+  return ['refs/remotes/origin/main', 'refs/remotes/origin/master'].find(
+    (ref) => git(['-C', dir, 'rev-parse', '--verify', '--quiet', ref]).ok,
+  );
+}
+
+function isAncestorOfDefaultBranch(wt) {
+  const base = defaultBranch(wt.path);
+  return Boolean(base) && git(['-C', wt.path, 'merge-base', '--is-ancestor', wt.head, base]).ok;
+}
+
+function isHeadOfMergedPullRequest(wt) {
+  if (!wt.branch) return false;
+  const prs = run('gh', ['pr', 'list', '--head', wt.branch, '--state', 'merged', '--json', 'headRefOid', '--limit', '1'], {
+    cwd: wt.path,
+    timeout: 20000,
+  });
+  try {
+    return prs.ok && JSON.parse(prs.out).some((pr) => pr.headRefOid === wt.head);
+  } catch {
+    return false;
+  }
+}
+
+function isMerged(wt) {
+  return isAncestorOfDefaultBranch(wt) || isHeadOfMergedPullRequest(wt);
+}
+
+function judge(target) {
+  if (target.verdict) return target;
+  const wt = target.worktree;
+  const running = target.stacks.flatMap((s) => s.containers.filter((c) => c.running));
+  const status = git(['--no-optional-locks', '-C', wt.path, 'status', '--porcelain']);
+  const changed = lines(status.out).length;
+  const verdict = worktreeVerdict({
+    running: running.length > 0,
+    dirty: !status.ok || changed > 0,
+    merged: isMerged(wt),
+    onRemote: git(['-C', wt.path, 'branch', '-r', '--contains', wt.head]).out.trim() !== '',
+  });
+  const localCommits = () => {
+    const count = git(['-C', wt.path, 'rev-list', '--count', wt.head, '--not', '--remotes']).out.trim();
+    return count === '1' ? '1 commit that exists' : `${count} commits that exist`;
+  };
+  const detail = {
+    running: () => `${running.length} of its containers are still running`,
+    dirty: () =>
+      status.ok
+        ? `it has ${changed} uncommitted ${changed === 1 ? 'file' : 'files'} that would be lost`
+        : `git status failed there (${status.err}), so uncommitted changes cannot be ruled out`,
+    unpushed: () => `it has ${localCommits()} only on this machine`,
+  }[verdict.kind];
+  return { ...target, verdict: detail ? { ...verdict, detail: detail() } : verdict };
+}
+
+function measureFolders(targets) {
+  let done = 0;
+  const measure = (target) =>
+    new Promise((resolve) => {
+      if (!target.worktree) return resolve(0);
+      execFile('du', ['-sk', target.worktree.path], (error, stdout) => {
+        progress(`Measuring folder sizes ${++done}/${targets.length}`);
+        resolve(parseInt(stdout, 10) * 1024 || 0);
+      });
+    });
+  return Promise.all(targets.map(measure)).finally(() => progress(''));
+}
+
+function describe(target) {
+  const label = VERDICTS[target.verdict.kind].label;
+  if (target.worktree) {
+    const branch = target.worktree.branch ? `branch ${target.worktree.branch}` : 'detached HEAD';
+    return `${target.worktree.path}  (${branch}, ${label})`;
+  }
+  const stack = target.stacks[0];
+  return `stack ${stack.project}  (${label}${stack.workingDir ? `, was started in ${stack.workingDir}` : ''})`;
+}
+
+function printPlan(target, bytes) {
+  const rows = planRows(target, bytes);
+  const shown = rows.map(([kind, name, size]) => [`  ${kind}`, name, size === null ? '' : formatSize(size)]);
+  console.log(describe(target));
+  console.log(columns([...shown, ['  total', '', formatSize(totalBytes(rows))]], [2]));
+}
+
+function ask(question) {
+  process.stdout.write(question);
+  const byte = Buffer.alloc(1);
+  let line = '';
+  for (;;) {
+    let read;
+    try {
+      read = fs.readSync(0, byte, 0, 1, null);
+    } catch (error) {
+      if (error.code === 'EAGAIN') continue;
+      if (error.code === 'EOF') read = 0;
+      else throw error;
+    }
+    if (read === 0) {
+      process.stdout.write('\n');
+      return line === '' ? null : line;
+    }
+    if (byte[0] === 10) return line;
+    line += byte.toString('latin1');
+  }
+}
+
+function interactive() {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function readKey() {
+  return new Promise((resolve) => {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.once('data', (data) => {
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      const key = data.toString();
+      if (key === '\x03') {
+        process.stdout.write('\n');
+        process.exit(130);
+      }
+      resolve(key);
+    });
+  });
+}
+
+async function confirm(question) {
+  if (!interactive()) return /^y(es)?$/i.test((ask(`${question} [y/N] `) || '').trim());
+  process.stdout.write(`${question} [y/n] `);
+  for (;;) {
+    const key = (await readKey()).toLowerCase();
+    if (key === 'y' || key === 'n') {
+      process.stdout.write(`${key}\n`);
+      return key === 'y';
+    }
+  }
+}
+
+function paint(line) {
+  if (process.env.NO_COLOR) return line;
+  if (line.startsWith('>')) return `\x1b[7m${line}\x1b[0m`;
+  if (line.startsWith('  [x]')) return `\x1b[32m${line}\x1b[0m`;
+  return line;
+}
+
+async function pick(targets, bytes) {
+  const home = os.homedir();
+  const texts = columns(
+    targets.map((t, i) => [
+      VERDICTS[t.verdict.kind].label,
+      formatSize(bytes[i]),
+      targetName(t).replace(home, '~'),
+      t.worktree ? t.worktree.branch || '(detached)' : '',
+    ]),
+    [1],
+  ).split('\n');
+  let state = { cursor: 0, checked: targets.map((t) => VERDICTS[t.verdict.kind].preMarked) };
+  let drawn = 0;
+  for (;;) {
+    const out = pickerLines(texts, bytes, state, process.stdout.columns || 80, (process.stdout.rows || 24) - 1);
+    process.stdout.write((drawn ? `\x1b[${drawn}A` : '') + out.map((line) => `\r\x1b[K${paint(line)}\n`).join(''));
+    drawn = out.length;
+    const key = await readKey();
+    if (key === '\r' || key === '\n') return state.checked.flatMap((c, i) => (c ? [i] : []));
+    if (key === 'q' || key === '\x1b') return [];
+    state = pickerStep(state, key);
+  }
+}
+
+async function pickAndConfirm(targets, bytes, opts) {
+  const chosen = [];
+  for (const i of await pick(targets, bytes)) {
+    const reason = opts.force ? null : risk(targets[i]);
+    if (!reason || (await confirm(`\n${targetName(targets[i])}\n  ${reason}. Delete it anyway?`))) chosen.push(i);
+  }
+  if (chosen.length === 0 || opts.dryRun) return chosen;
+  const total = formatSize(chosen.reduce((sum, i) => sum + bytes[i], 0));
+  const sure = await confirm(`\nDelete ${chosen.length === 1 ? '1 item' : `${chosen.length} items`}, ${total} in total?`);
+  return sure ? chosen : [];
+}
+
+function destroy(target) {
+  let ok = true;
+  const remove = (what, args, gone) => {
+    const result = run('docker', args);
+    if (result.ok || gone.test(result.err)) {
+      console.log(`  removed ${what}`);
+    } else {
+      ok = false;
+      console.error(`  could not remove ${what}: ${result.err}`);
+    }
+  };
+  const all = (key) => target.stacks.flatMap((s) => s[key]);
+  if (target.worktree) process.chdir(target.worktree.repo);
+  for (const c of all('containers')) remove(`container ${c.name}`, ['rm', '-f', '-v', c.id], /no such container/i);
+  for (const n of all('networks')) remove(`network ${n}`, ['network', 'rm', n], /not found|no such network/i);
+  for (const v of all('volumes')) remove(`volume ${v.name}`, ['volume', 'rm', v.name], /no such volume/i);
+  for (const i of all('images')) remove(`image ${i.ref}`, ['image', 'rm', i.ref], /no such image/i);
+  if (target.worktree) {
+    const { path: folder, repo } = target.worktree;
+    if (fs.existsSync(folder)) {
+      const result = git(['-C', repo, 'worktree', 'remove', '--force', folder]);
+      if (result.ok) {
+        console.log(`  removed folder ${folder}`);
+      } else {
+        ok = false;
+        console.error(`  could not remove folder ${folder}: ${result.err}`);
+      }
+    }
+    git(['-C', repo, 'worktree', 'prune']);
+  }
+  return ok;
+}
+
+async function teardownOne(opts) {
+  const start = path.resolve(opts.positional || '.');
+  if (!fs.existsSync(start)) {
+    fail(`${start} does not exist, so there is nothing to tear down there. Run "teardown sweep" to find leftover stacks.`);
+  }
+  const rev = git(['-C', start, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir']);
+  if (!rev.ok) fail(`${start} is not inside a git repository.`);
+  const [top, gitDir, commonDir] = lines(rev.out).map(real);
+  if (gitDir === commonDir) fail(`${top} is a main checkout, not a linked worktree. teardown only removes linked worktrees.`);
+
+  const stacks = loadStacks();
+  const checkouts = discoverCheckouts(stacks, mainCheckoutOf(commonDir));
+  const found = buildTargets(stacks, checkouts, fs.existsSync).find((t) => t.worktree && t.worktree.path === top);
+  if (!found) fail(`${top} is not listed by "git worktree list".`);
+  const target = judge(found);
+  const verdict = VERDICTS[target.verdict.kind];
+  const reason = opts.force ? null : risk(target);
+  if (reason && !opts.dryRun && (opts.yes || !interactive())) {
+    fail(`refusing to tear down ${top} because ${reason} (${verdict.label}). Run with --force to delete it anyway.`);
+  }
+
+  printPlan(target, (await measureFolders([target]))[0]);
+  if (opts.dryRun) return;
+  const question = reason ? `Careful: ${reason}. Delete all of this anyway?` : 'Delete all of this?';
+  if (!opts.yes && !(await confirm(question))) {
+    console.log('Nothing deleted.');
+    return;
+  }
+  if (!destroy(target)) process.exitCode = 1;
+}
+
+function chooseTargets(targets, opts) {
+  const kinds = targets.map((t) => t.verdict.kind);
+  if (opts.yes || opts.dryRun) return parseSelection('', kinds, false).indices;
+  for (;;) {
+    const answer = ask('\nTear down which? Enter = the [x] rows, numbers like "1 3", n = none: ');
+    if (answer === null) return [];
+    const selection = parseSelection(answer, kinds, opts.force);
+    if (selection.indices) return selection.indices;
+    console.log(selection.error);
+  }
+}
+
+async function offerBuildCache(opts) {
+  const row = lines(docker(['system', 'df', '--format', 'json']))
+    .map((l) => JSON.parse(l))
+    .find((r) => r.Type === 'Build Cache');
+  const bytes = row ? parseSize(row.Reclaimable.split(' ')[0]) : 0;
+  console.log(`\nDocker build cache: ${formatSize(bytes)} reclaimable.`);
+  if (opts.dryRun || opts.yes || bytes === 0) return;
+  if (!(await confirm('Free it?'))) return;
+  const result = run('docker', ['builder', 'prune', '-af']);
+  if (result.ok) {
+    console.log('Freed the Docker build cache.');
+  } else {
+    process.exitCode = 1;
+    console.error(`could not free the build cache: ${result.err}`);
+  }
+}
+
+async function sweep(opts) {
+  progress('Reading Docker stacks');
+  const stacks = loadStacks();
+  progress('Finding repositories');
+  const candidates = filterTargets(buildTargets(stacks, discoverCheckouts(stacks, null), fs.existsSync), opts.positional);
+  if (opts.fetch) {
+    for (const repo of new Set(candidates.filter((t) => t.worktree).map((t) => t.worktree.repo))) {
+      progress('Fetching ', repo);
+      const result = git(['-C', repo, 'fetch', '--prune', '--quiet']);
+      if (!result.ok) {
+        progress('');
+        console.error(`teardown: warning: git fetch failed in ${repo}: ${result.err}`);
+      }
+    }
+  }
+  const targets = candidates.map((target, i) => {
+    progress(`Checking ${i + 1}/${candidates.length}: `, targetName(target));
+    return judge(target);
+  });
+  progress('');
+
+  if (targets.length === 0) {
+    console.log('Nothing to tear down.');
+  } else {
+    const bytes = await measureFolders(targets);
+    const totals = targets.map((t, i) => totalBytes(planRows(t, bytes[i])));
+    const usePicker = interactive() && !opts.yes;
+    if (!usePicker) {
+      const rows = targets.map((t, i) => [
+        String(i + 1),
+        VERDICTS[t.verdict.kind].preMarked ? '[x]' : '[ ]',
+        VERDICTS[t.verdict.kind].label,
+        formatSize(totals[i]),
+        targetName(t),
+        t.worktree ? t.worktree.branch || '(detached)' : '',
+      ]);
+      console.log(columns([['#', '', 'verdict', 'size', 'target', 'branch'], ...rows], [0, 3]));
+    }
+
+    const chosen = usePicker ? await pickAndConfirm(targets, totals, opts) : chooseTargets(targets, opts);
+    for (const i of chosen) {
+      console.log('');
+      printPlan(targets[i], bytes[i]);
+      if (!opts.dryRun && !destroy(targets[i])) process.exitCode = 1;
+    }
+    if (chosen.length === 0) console.log('\nNothing selected.');
+  }
+
+  if (!opts.keepBuildCache) await offerBuildCache(opts);
+}
+
+if (require.main === module) {
+  const opts = parseArgs(process.argv.slice(2));
+  (opts.sweep ? sweep(opts) : teardownOne(opts)).catch((error) => fail(error.message));
+} else {
+  module.exports = { parseSize, formatSize, sanitizeProject, nameMatches, worktreeVerdict, parseSelection, pickerStep, pickerLines };
+}
